@@ -143,6 +143,11 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
-/smc_track_data/
+/smc_track_data/smc_track_data.zip
 /public_data/
 /.idea/
+/research/
+/private_data/
+/public_data/
+/saved_model/
+/SplitInputs/
