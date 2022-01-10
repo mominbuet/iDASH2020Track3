@@ -3,14 +3,14 @@ import json
 import logging
 import operator
 import pickle
-import random
+import shutil
 import socket
 import time
 from math import sqrt
-import shutil
 
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
+from xgboost import XGBRFClassifier
 
 from DescisionTreeHelper import subsample, build_tree, bagging_predict
 from SocketUtils import *
@@ -57,7 +57,7 @@ def getHistogram(minX, maxX, dataX, numbins):
 
 def getExponentialHist(digitized, numbins, EPSILON, sensitivity=1):
     exponentialNoisyDigitized = digitized
-    perColumnEpsilon = EPSILON/digitized.shape[1]
+    perColumnEpsilon = EPSILON / digitized.shape[1]
     for cIndex in range(digitized.shape[1]):
 
         probs = np.zeros(numbins)
@@ -139,6 +139,15 @@ def calcVariance(inputDataX, mean, class_length):
     return partialVariance
 
 
+def getXGBOOSTModels():
+    models = dict()
+    # define the number of trees to consider
+    n_trees = [10, 50, 100, 500, 1000, 5000]
+    for v in n_trees:
+        models[str(v)] = XGBRFClassifier(n_estimators=v, subsample=0.9, colsample_bynode=0.2)
+    return models
+
+
 def main():
     start_time = time.time()
     # set values from config
@@ -150,21 +159,21 @@ def main():
 
     CSVDelimiter = config.get("DataInfo", "CSVDelimiter")
 
-    epsilon = config.getfloat("PrivacyParams", "Epsilon")
+    # epsilon = config.getfloat("PrivacyParams", "Epsilon")
     multiplier = config.getfloat("TrainingInfo", "multiplier")
 
-    randomstate = config.getint("TrainingInfo", 'randomstate')#using this to set the make train-test set
+    randomstate = config.getint("TrainingInfo", 'randomstate')  # using this to set the make train-test set
     inputPrivacy = config.getboolean("PrivacyParams", 'InputPrivacy')
     checkTrainingAccuracy = config.getboolean("PrivacyParams", 'CheckTrainingAccuracy')
 
     customHistogram = config.getboolean("PrivacyParams", 'CustomHistogram')
     exponentialHistogram = config.getboolean("PrivacyParams", 'ExponentialHistogram')
-    assert customHistogram != exponentialHistogram, 'Please select either CustomHistogram or ExponentialHistogram'
+    # assert customHistogram != exponentialHistogram, 'Please select either CustomHistogram or ExponentialHistogram'
 
     noisyMechanism = config.getboolean("PrivacyParams", 'NoisyMechanism')  # experimental
     if not inputPrivacy and not noisyMechanism:
         logging.error("No privacy setting selected! Please put yes to 'NoisyMechanism' or 'InputPrivacy'")
-        return
+        # return
 
     NumBins = config.getint('TrainingInfo', 'NumBins')
     MLAlgo = config.get('TrainingInfo', 'Algorithm')
@@ -172,180 +181,232 @@ def main():
     logging.basicConfig(format='%(levelname)s:%(message)s',
                         level=logging._nameToLevel[config.get("TrainingInfo", "DebugLevel")])
 
-    # data Section
-    # for competetion
-    dataX, dataY = getDataFromPath(Party1NormalData, Party1TumorData, CSVDelimiter, balance=False, isShuffle=True,
-                                   remove_test=False)
-    # for random data
-    # dataX, dataY = getData(DATASETNAME)
-    #only take 80% for training
-    dataX, _, dataY,_  = train_test_split(dataX, dataY, random_state=randomstate,
-                                                                    train_size=int(len(dataX) * 0.8))
-
-    # dataX, dataY = dataTrainX[:len(dataTrainX) // 2], dataTrainY[:len(dataTrainY) // 2]
-
-    # saving a copy before noise to test on this data later
-    # dataOriginalX = dataX
-    indices = np.random.randint(low=0, high=len(dataX), size=len(dataX) // 2)
-    dataX = dataX[indices]
-    dataY =  dataY[indices]
-    dataOriginalX = dataX
-    dataOriginalY = dataY
-    # just for checking
-
-    # dataX = preprocessData(dataX)
+    aucs = []
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # socket.gethostname()
     server_socket.bind((Party1IP, Party1Port))
     server_socket.listen(1)
     print('Waiting for Party 2 on {}:{}'.format(socket.gethostname(), Party1Port))
+
+    allDataX, allDataY = getDataFromPath(Party1NormalData, Party1TumorData, CSVDelimiter, balance=False,
+                                   isShuffle=True,
+                                   remove_test=False, random_state=randomstate)
     while True:
         # now our endpoint knows about the OTHER endpoint.
         clientsocket, address = server_socket.accept()
         print("Party 1: Accepted connection %s:%s" % (address[0], address[1]))
 
-        # inputData = []
-        sortedIndices = []
-        reducedDimension = config.getint("TrainingInfo", "ReducedDimension")
-        if reducedDimension > 0:
-            dataXScaled = dataX / np.linalg.norm(dataX)
-            varianceColumn = dataXScaled.var(axis=0)
-            sortedIndices = np.argsort(varianceColumn)
-            data = recvLargeMsg(clientsocket)
-            data = json.loads(data.decode())
-            multiplier = 2
-            if (reducedDimension < 40):
-                multiplier = 4
-            tmp = sortedIndices[-reducedDimension * multiplier:]
-            sortedIndices = tmp[np.in1d(sortedIndices[-reducedDimension * multiplier:], data[-reducedDimension * 4:])]
-            sendLargemsg(clientsocket, json.dumps(sortedIndices[-reducedDimension:].tolist()))
-            dataX = dataX[:, sortedIndices[-reducedDimension:]]
-            dataOriginalX = dataOriginalX[:, sortedIndices[-reducedDimension:]]
+        for ind in range(randomstate, randomstate + 10):
+            epsilon = config.getfloat("PrivacyParams", "Epsilon")
+            start_time = time.time()
+            # data Section
+            # for competetion
+            # for random data
+            # dataX, dataY = getData(DATASETNAME)
+            # only take 80% for training
+            currDataX, _, curDataY, _ = train_test_split(allDataX, allDataY, random_state=ind,
+                                                         train_size=int(len(allDataX) * 0.8))
 
-        if inputPrivacy:
+            # dataX, dataY = dataTrainX[:len(dataTrainX) // 2], dataTrainY[:len(dataTrainY) // 2]
 
-            if epsilon == 0:
-                logging.error("Epsilon must be greater than 0 for private input settings")
-            else:
-                epsilon /= dataX.shape[1]
-            if customHistogram:
-                # increase the
-                dataX = dataX * multiplier
-                minX, maxX = getNoisyMinMax(dataX, epsilon / 2)  # spending half of the budget for noisy min-max
-                minX = setArrays(clientsocket, minX, operator.lt)
-                maxX = setArrays(clientsocket, maxX, operator.gt)
+            # saving a copy before noise to test on this data later
+            # dataOriginalX = dataX
+            indices = np.random.randint(low=0, high=len(curDataY), size=len(curDataY) // 2)
+            currDataX = currDataX[indices]
+            curDataY = curDataY[indices]
+            dataOriginalX = currDataX
+            dataOriginalY = curDataY
 
-                inputData = getHistogram(minX, maxX, dataX, NumBins)
-                # if CustomExponentialHistogram:
-                inputData = getExponentialHist(inputData, NumBins, epsilon / 2)
+            # inputData = []
+            sortedIndices = []
+            reducedDimension = config.getint("TrainingInfo", "ReducedDimension")
+            if reducedDimension > 0:
+                dataXScaled = currDataX / np.linalg.norm(currDataX)
+                varianceColumn = dataXScaled.var(axis=0)
+                sortedIndices = np.argsort(varianceColumn)
+                data = recvLargeMsg(clientsocket)
+                data = json.loads(data.decode())
+                multiplier = 2
+                tmp = sortedIndices[-reducedDimension * multiplier:]
+                sortedIndices = tmp[
+                    np.in1d(sortedIndices[-reducedDimension * multiplier:], data[-reducedDimension * 4:])]
+                sendLargemsg(clientsocket, json.dumps(sortedIndices[-reducedDimension:].tolist()))
+                currDataX = currDataX[:, sortedIndices[-reducedDimension:]]
+                dataOriginalX = dataOriginalX[:, sortedIndices[-reducedDimension:]]
 
-            elif exponentialHistogram:
-                dataX = dataX * multiplier
-                inputData = bucketizeData(dataX, numbins=NumBins, epsilon=epsilon)
-            else:
-                # this should not be used!! Sensitivity not okay
-                # norm = np.linalg.norm(dataX)
-                inputData = dataX
-                # inputData = 100 * (dataX / norm)
-                noisyDataX = np.random.laplace(loc=0.0, scale=1 / epsilon, size=(len(dataX), len(dataX[0])))
-                inputData = inputData + noisyDataX + 0.00001
-        else:
-            # no input privacy
-            inputData = dataX
+            if inputPrivacy:
 
-        logging.info("Algorithm {} input shape {} Epsilon {}".format(MLAlgo, inputData.shape,
-                                                                     config.getfloat("PrivacyParams", "Epsilon")))
-        dataset = np.append(inputData, dataY[:, None], axis=1)
-        accuracy = 1.0
-        if MLAlgo == 'NAIVEBAYES':
-            sums, class_lengths, separated = getSums(dataset)
-            if noisyMechanism:
-                sums = addNoise(sums, epsilon)
-            # sums[class_value].append(len(rows))
-            # logging.debug(sums)
-            data = recvLargeMsg(clientsocket)
-            sendLargemsg(clientsocket, json.dumps(sums))
-            sums = aggregateDict(sums, data, separated.keys())
-            # logging.debug(sums)
-
-            data = recvLargeMsg(clientsocket)
-            sendLargemsg(clientsocket, json.dumps(class_lengths))
-            class_lengths = aggregateDict(class_lengths, data, separated.keys())
-            # print(class_lengths)
-
-            stat1 = calcMean(sums, class_lengths)
-            logging.debug(stat1)
-
-            partialvariance = calcVariance(separated, stat1, class_lengths)
-
-            data = recvLargeMsg(clientsocket)
-            sendLargemsg(clientsocket, json.dumps(partialvariance))
-            partialvariance = aggregateDict(partialvariance, data, separated.keys())
-
-            stat2 = dict()
-            for key in partialvariance.keys():
-                stat2[key] = np.sqrt(partialvariance[key])
-            logging.debug(stat2)
-            # train accuracy
-
-            if checkTrainingAccuracy:
-                accuracy = accuracy_score(getPrediction(dataOriginalX, class_lengths, stat1, stat2),
-                                          dataOriginalY)
-                logging.info('checking training accuracy: {}'.format(accuracy))
-
-            savePath = os.path.join('saved_model', MLAlgo)
-            if os.path.exists(savePath):
-                shutil.rmtree(savePath)
-            os.makedirs(savePath)
-            with open(savePath + os.path.sep + 'model.pickle', 'wb') as f:
-                pickle.dump(class_lengths, f, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(stat1, f, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(stat2, f, protocol=pickle.HIGHEST_PROTOCOL)
-                # if accuracy 0 for traininig then switch the predictions
-                pickle.dump(accuracy < .5, f, protocol=pickle.HIGHEST_PROTOCOL)
-                if len(sortedIndices) > 0:
-                    pickle.dump(sortedIndices[-reducedDimension:], f,
-                                protocol=pickle.HIGHEST_PROTOCOL)  # accuracy < 0.55
-
-                logging.info("saved model into {}".format(savePath))
-
-        elif MLAlgo == 'RFOREST':
-            trees = list()
-            n_trees = config.getint("TrainingInfo", "n_trees")
-            max_depth = config.getint("TrainingInfo", "max_depth")
-            min_size = config.getint("TrainingInfo", "min_size")
-            sample_size = 1.0
-            n_features = round(sqrt(len(dataX[0]) - 1))
-            for i in range(n_trees):
-                if sample_size == 1:
-                    sample = shuffle(dataset)
+                if epsilon == 0:
+                    logging.error("Epsilon must be greater than 0 for private input settings")
                 else:
-                    sample = subsample(dataset, sample_size)
-                tree = build_tree(sample, max_depth, min_size, n_features)
-                trees.append(tree)
-            if checkTrainingAccuracy:
-                predicted = [bagging_predict(trees, row) for row in dataOriginalX]
-                accuracy = accuracy_score(predicted, dataOriginalY)
-                logging.info('checking training accuracy: {}'.format(accuracy))
+                    epsilon /= currDataX.shape[1]
+                if customHistogram:
+                    # increase the
+                    currDataX = currDataX * multiplier
+                    minX, maxX = getNoisyMinMax(currDataX, epsilon / 2)  # spending half of the budget for noisy min-max
+                    minX = setArrays(clientsocket, minX, operator.lt)
+                    maxX = setArrays(clientsocket, maxX, operator.gt)
 
-            p2trees = recvLargeMsg(clientsocket)
-            p2trees = json.loads(p2trees.decode())
-            for p2tree in p2trees:
-                trees.append(p2tree)
-            savePath = os.path.join('saved_model', MLAlgo)
-            if os.path.exists(savePath):
-                shutil.rmtree(savePath)
-            os.makedirs(savePath)
+                    inputData = getHistogram(minX, maxX, currDataX, NumBins)
+                    # if CustomExponentialHistogram:
+                    inputData = getExponentialHist(inputData, NumBins, epsilon / 2)
 
-            with open(savePath + os.path.sep + 'model.pickle', 'wb') as f:
-                pickle.dump(trees, f, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(accuracy < .35, f, protocol=pickle.HIGHEST_PROTOCOL)
-                if len(sortedIndices) > 0:
-                    pickle.dump(sortedIndices[-reducedDimension:], f, protocol=pickle.HIGHEST_PROTOCOL)
-                logging.info("saved model into {}".format(savePath))
+                elif exponentialHistogram:
+                    currDataX = currDataX * multiplier
+                    inputData = bucketizeData(currDataX, numbins=NumBins, epsilon=epsilon)
+                else:
+                    # this should not be used!! Sensitivity not okay
+                    # norm = np.linalg.norm(dataX)
+                    inputData = currDataX
+                    # inputData = 100 * (dataX / norm)
+                    noisyDataX = np.random.laplace(loc=0.0, scale=1 / epsilon, size=(len(currDataX), len(currDataX[0])))
+                    inputData = inputData + noisyDataX + 0.00001
+            else:
+                # no input privacy
+                currDataX = currDataX * multiplier
+                inputData = currDataX
 
-        print('finished P1, Execution Time {} seconds'.format(int(time.time() - start_time)))
+            logging.info("Algorithm {} input shape {} Epsilon {}".format(MLAlgo, inputData.shape,
+                                                                         config.getfloat("PrivacyParams", "Epsilon")))
+            dataset = np.append(inputData, curDataY[:, None], axis=1)
+            accuracy = 1.0
+            if MLAlgo == 'NAIVEBAYES':
+                sums, class_lengths, separated = getSums(dataset)
+                if noisyMechanism: #add noice to the sum values rather than data
+                    sums = addNoise(sums, epsilon)
+                # sums[class_value].append(len(rows))
+                # logging.debug(sums)
+                data = recvLargeMsg(clientsocket)
+                sendLargemsg(clientsocket, json.dumps(sums))
+                sums = aggregateDict(sums, data, separated.keys())
+                # logging.debug(sums)
+
+                data = recvLargeMsg(clientsocket)
+                sendLargemsg(clientsocket, json.dumps(class_lengths))
+                class_lengths = aggregateDict(class_lengths, data, separated.keys())
+                # print(class_lengths)
+
+                stat1 = calcMean(sums, class_lengths)
+                logging.debug(stat1)
+
+                partialvariance = calcVariance(separated, stat1, class_lengths)
+
+                data = recvLargeMsg(clientsocket)
+                sendLargemsg(clientsocket, json.dumps(partialvariance))
+                partialvariance = aggregateDict(partialvariance, data, separated.keys())
+
+                stat2 = dict()
+                for key in partialvariance.keys():
+                    stat2[key] = np.sqrt(partialvariance[key])
+                logging.debug(stat2)
+                # train accuracy
+
+                if checkTrainingAccuracy:
+                    accuracy = accuracy_score(getPrediction(dataOriginalX, class_lengths, stat1, stat2),
+                                              dataOriginalY)
+                    logging.info('checking training accuracy: {}'.format(accuracy))
+
+                savePath = os.path.join('saved_model', MLAlgo)
+                if os.path.exists(savePath):
+                    shutil.rmtree(savePath)
+                os.makedirs(savePath)
+                with open(savePath + os.path.sep + 'model.pickle', 'wb') as f:
+                    pickle.dump(class_lengths, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(stat1, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(stat2, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    # if accuracy 0 for traininig then switch the predictions
+                    pickle.dump(accuracy < .5, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    if len(sortedIndices) > 0:
+                        pickle.dump(sortedIndices[-reducedDimension:], f,
+                                    protocol=pickle.HIGHEST_PROTOCOL)  # accuracy < 0.55
+                    logging.info("saved model into {}".format(savePath))
+
+            elif MLAlgo == 'RFOREST':
+                trees = list()
+                n_trees = config.getint("TrainingInfo", "n_trees")
+                max_depth = config.getint("TrainingInfo", "max_depth")
+                min_size = config.getint("TrainingInfo", "min_size")
+                sample_size = 1.0
+                n_features = round(sqrt(len(currDataX[0]) - 1))
+                for i in range(n_trees):
+                    if sample_size == 1:
+                        sample = shuffle(dataset)
+                    else:
+                        sample = subsample(dataset, sample_size)
+                    tree = build_tree(sample, max_depth, min_size, n_features)
+                    trees.append(tree)
+                if checkTrainingAccuracy:
+                    predicted = [bagging_predict(trees, row) for row in dataOriginalX]
+                    accuracy = accuracy_score(predicted, dataOriginalY)
+                    logging.info('checking training accuracy: {}'.format(accuracy))
+
+                p2trees = recvLargeMsg(clientsocket)
+                p2trees = json.loads(p2trees.decode())
+                for p2tree in p2trees:
+                    trees.append(p2tree)
+                savePath = os.path.join('saved_model', MLAlgo)
+                if os.path.exists(savePath):
+                    shutil.rmtree(savePath)
+                os.makedirs(savePath)
+
+                with open(savePath + os.path.sep + 'model.pickle', 'wb') as f:
+                    pickle.dump(trees, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(accuracy < .35, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    if len(sortedIndices) > 0:
+                        pickle.dump(sortedIndices[-reducedDimension:], f, protocol=pickle.HIGHEST_PROTOCOL)
+                    logging.info("saved model into {}".format(savePath))
+
+            elif MLAlgo == 'XGBOOST':
+                p2DataY = recvLargeMsg(clientsocket)
+                p2DataX = recvLargeMsg(clientsocket)
+
+                p2DataX = json.loads(p2DataX.decode())
+                p2DataY = json.loads(p2DataY.decode())
+                joinedX = [*inputData, *p2DataX]
+                joinedY = [*curDataY, *p2DataY]
+                model = XGBRFClassifier(n_estimators=100, subsample=0.9, colsample_bynode=0.2)
+                model.fit(joinedX, joinedY)
+                savePath = os.path.join('saved_model', MLAlgo)
+                if os.path.exists(savePath):
+                    shutil.rmtree(savePath)
+                os.makedirs(savePath)
+                accuracy = 1.0  # dont switch
+                with open(savePath + os.path.sep + 'model.pickle', 'wb') as f:
+                    pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    pickle.dump(accuracy < .35, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    if len(sortedIndices) > 0:
+                        pickle.dump(sortedIndices[-reducedDimension:], f, protocol=pickle.HIGHEST_PROTOCOL)
+                    logging.info("saved model into {}".format(savePath))
+
+            print('finished P1, Train Execution Time {} seconds'.format(int(time.time() - start_time)))
+
+
+            # TestTumorFile = config.get("DataInfo", "Party2Tumor")
+            # TestNormalFile = config.get("DataInfo", "Party2Normal")
+            ###
+            # currDataX, allDataY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
+            # TestTumorFile = config.get("DataInfo", "Party1Tumor")
+            # TestNormalFile = config.get("DataInfo", "Party1Normal")
+            # tmpX, tmpY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
+            # currDataX =np.concatenate((currDataX,tmpX))
+            # allDataY = np.concatenate((allDataY,tmpY))
+            # TestTumorFile = config.get("DataInfo", "TestTumorFile")
+            # TestNormalFile = config.get("DataInfo", "TestNormalFile")
+            # tmpX, tmpY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
+            # currDataX = np.concatenate((currDataX, tmpX))
+            # allDataY = np.concatenate((allDataY, tmpY))
+
+            # currDataX, allDataY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
+            _, dataTestX, _, dataTestY = train_test_split(allDataX, allDataY, random_state=ind,
+                                                          train_size=int(len(allDataX) * 0.8))
+            start_time = time.time()
+            _, _, _, auc = TestModelRun(dataTestX, dataTestY)
+            print('finished P1, Test Execution Time {} seconds'.format((time.time() - start_time)))
+
+            # this auc is averaged over X times with X different runs
+            aucs.append(auc)
+
         sendData(clientsocket, b'done')
         data = recvData(clientsocket)
         if data == b'done':
@@ -353,42 +414,15 @@ def main():
             break
 
     closeSocket(server_socket)
-    aucs = []
-    TestTumorFile = config.get("DataInfo", "Party2Tumor")
-    TestNormalFile = config.get("DataInfo", "Party2Normal")
-    # allDataX, allDataY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
-    # TestTumorFile = config.get("DataInfo", "Party1Tumor")
-    # TestNormalFile = config.get("DataInfo", "Party1Normal")
-    # tmpX, tmpY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
-    # allDataX =np.concatenate((allDataX,tmpX))
-    # allDataY = np.concatenate((allDataY,tmpY))
-    # TestTumorFile = config.get("DataInfo", "TestTumorFile")
-    # TestNormalFile = config.get("DataInfo", "TestNormalFile")
-    # tmpX, tmpY = getDataFromPath(TestNormalFile, TestTumorFile, CSVDelimiter, balance=False, isShuffle=True)
-    # allDataX = np.concatenate((allDataX, tmpX))
-    # allDataY = np.concatenate((allDataY, tmpY))
 
-
-
-    allDataX, allDataY = getData(TestNormalFile.split('/')[1].split('-')[0])
-    _, dataTestX, _, dataTestY = train_test_split(allDataX, allDataY, random_state=randomstate,
-                                          train_size=int(len(allDataX) * 0.8))
-    #TODO: do this on a loop
-    start_time = time.time()
-    _, _, _, auc = TestModelRun(dataTestX, dataTestY)
-    print('finished P1, Execution Time {} seconds'.format((time.time() - start_time)))
-
-    #this auc is averaged over 5 times with 5 different runs
-
-    aucs.append(auc)
-    for i in range(10):
-        _, testDataX, _, testDataY = train_test_split(allDataX, allDataY, train_size=int(len(allDataY) * 0.8), shuffle=True)
-        accuracy, precision, recall, auc = TestModelRun(testDataX, testDataY)
-        # print("accuracy {:.3f} precision {:.3f} recall {:.3f} auc {:.3f}".
-        #       format(accuracy, precision * 100, recall * 100, auc))
-        aucs.append(auc)
-    print(f'dataset {TestTumorFile} test auc {aucs[0]} average auc {np.average(aucs)}')
-    # TestModelRun()
+# for i in range(10):
+#     _, testDataX, _, testDataY = train_test_split(allDataX, allDataY, train_size=int(len(allDataY) * 0.8), shuffle=True)
+#     accuracy, precision, recall, auc = TestModelRun(testDataX, testDataY)
+#     # print("accuracy {:.3f} precision {:.3f} recall {:.3f} auc {:.3f}".
+#     #       format(accuracy, precision * 100, recall * 100, auc))
+#     aucs.append(auc)
+    print(f'test auc {aucs[0]} average auc {np.average(aucs)}')
+# TestModelRun()
 
 
 if __name__ == "__main__":
